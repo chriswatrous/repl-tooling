@@ -3,6 +3,7 @@
   (:require [repl-tooling.repl-client :as client]
             [cljs.core.async :as async :refer-macros [go go-loop]]
             [cljs.reader :as reader]
+            [clojure.string :as str]
             [repl-tooling.eval :as eval]
             [repl-tooling.features.autocomplete :as f-auto]
             [repl-tooling.repl-client.cljs.autocomplete :as cljs-auto]
@@ -10,15 +11,40 @@
 
 (def blob (cljs-blob-contents))
 
-(defn evaluate-code [in pending command opts callback]
-  (let [id (gensym)
-        code (str "(cljs.core/pr-str (try (clojure.core/let [res\n(do\n" command
-                  "\n)] ['" id " :result (cljs.core/pr-str res)]) (catch :default e "
-                  "['" id " :error (cljs.core/pr-str e)])))\n")]
+; Having 2 different ways of wrapping an expression for evaluation is a hack to get around the fact
+; that some expressions don't work inside of try/do/let (ns, require, maybe others), while other
+; expressions don't work with eval (eval #js {})
+
+(def ^:private last-map-eval-template
+  '(cljs.core/pr-str
+     (try
+       (cljs.core/let [res (cljs.core/last (cljs.core/map cljs.core/eval '[-code-]))]
+         ['-id- :result (cljs.core/pr-str res)])
+       (catch :default e
+         ['-id- :error (cljs.core/pr-str e)]))))
+
+(def ^:private do-template
+  '(cljs.core/pr-str
+     (try
+       (cljs.core/let [res (do -code-)]
+         ['-id- :result (cljs.core/pr-str res)])
+       (catch :default e
+         ['-id- :error (cljs.core/pr-str e)]))))
+
+(defn- wrap-code-for-eval [code id]
+  (-> (if (some #(str/starts-with? code %) ["(ns " "(require "])
+        last-map-eval-template
+        do-template)
+      pr-str
+      (str/replace "-id-" (str id))
+      (str/replace "-code-" code)))
+
+(defn evaluate-code [in pending code opts callback]
+  (let [id (gensym)]
     (swap! pending assoc id {:callback callback :opts opts})
     (when-let [ns-name (:namespace opts)]
-      (async/put! in (str "(ns " ns-name ")")))
-    (async/put! in code)
+      (async/put! in (str "(in-ns '" ns-name ")")))
+    (async/put! in (wrap-code-for-eval code id))
     id))
 
 (defn- generic-autocomplete [repl ns-name prefix]
@@ -80,7 +106,12 @@
 
 (defn- pending-evals [pending output-fn out]
   (try
-    (treat-result-of-call (-> out reader/read-string reader/read-string)
+    (treat-result-of-call (-> out
+                              ; Sometimes the prompt shows up in the received output, so remove
+                              ; that.
+                              (str/replace #"^.*?=> " "")
+                              reader/read-string
+                              reader/read-string)
                           pending output-fn)
     (catch :default _
       (output-fn {:out out}))))
